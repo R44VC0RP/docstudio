@@ -43,13 +43,18 @@ final class Graph: NSView {
         NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
         let colors = [NSColor(calibratedRed: 0.36, green: 0.84, blue: 0.96, alpha: 1), NSColor(calibratedRed: 0.75, green: 0.64, blue: 1, alpha: 1)]
         for (i, data) in [cpu, memory].enumerated() {
-            let row = bounds.height / 2
-            let y = bounds.height - CGFloat(i + 1) * row
-            let font = NSFont(name: "Helvetica Neue", size: max(8, min(11, row * 0.43)))!
+            let scale = bounds.height / 33
+            let padding = 5 * scale
+            let row = (bounds.height - 6 * scale) / 2
+            let y = bounds.height - 3 * scale - CGFloat(i + 1) * row
+            let font = NSFont(name: "Helvetica Neue", size: 8 * scale)!
             let value = data.last ?? 0
-            let label = "\(i == 0 ? "CPU" : "Mem") \(Int(value * 100))%"
-            (label as NSString).draw(at: CGPoint(x: 6, y: y + row - font.pointSize - 3), withAttributes: [.font: font, .foregroundColor: colors[i]])
-            let graph = CGRect(x: 6, y: y + 3, width: bounds.width - 12, height: max(4, row - font.pointSize - 7))
+            let label = "\(i == 0 ? "CPU" : "Mem") \(Int(value * 100))%" as NSString
+            let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: colors[i]]
+            let textHeight = label.size(withAttributes: attributes).height
+            label.draw(at: CGPoint(x: padding, y: y + (row - textHeight) / 2), withAttributes: attributes)
+            let graphX = 50 * scale
+            let graph = CGRect(x: graphX, y: y + (row - 8 * scale) / 2, width: max(4, bounds.width - graphX - padding), height: 8 * scale)
             let path = NSBezierPath(); path.lineWidth = 1.2
             for (j, v) in data.enumerated() {
                 let p = CGPoint(x: graph.maxX - CGFloat(data.count - 1 - j) * graph.width / 59, y: graph.minY + CGFloat(v) * graph.height)
@@ -103,7 +108,8 @@ final class Delegate: NSObject, NSApplicationDelegate {
         let tileHeight = min(a.width, b.width) - 2
         let height = (tileHeight * 0.8).rounded()
         let topInset = (tileHeight - height) / 2 + 7
-        let frame = CGRect(x: union.minX + 2, y: desktopTop - union.minY - height - topInset, width: union.width - 4, height: height)
+        let sideInset = (min(a.width, b.width) - height) / 2
+        let frame = CGRect(x: union.minX + sideInset, y: desktopTop - union.minY - height - topInset, width: union.width - 2 * sideInset, height: height)
         guard NSScreen.screens.contains(where: { $0.frame.intersects(frame) }), frame.minY >= 0 else { panel.orderOut(nil); return }
         panel.setFrame(frame, display: true); panel.orderFrontRegardless()
     }
