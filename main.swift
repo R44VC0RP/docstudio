@@ -1,14 +1,13 @@
 import AppKit
 import ApplicationServices
 import Darwin
-import QuartzCore
 
 let domain = "com.apple.dock" as CFString
 let placement = UserDefaults(suiteName: "local.dock-2u")!
-let reservedSlots = 3
-func slotIndex(in entries: [[String: Any]]) -> Int? {
+var reservedSlots = 2
+func slotIndex(in entries: [[String: Any]], count: Int = reservedSlots) -> Int? {
     let indices = entries.indices.filter { entries[$0]["tile-type"] as? String == "spacer-tile" }
-    guard indices.count == reservedSlots, indices == Array(indices[0]..<(indices[0] + reservedSlots)) else { return nil }
+    guard (2...4).contains(count), indices.count == count, indices == Array(indices[0]..<(indices[0] + count)) else { return nil }
     return indices[0]
 }
 func tiles() -> [[String: Any]] {
@@ -18,15 +17,18 @@ func tiles() -> [[String: Any]] {
 func setTiles(_ value: [[String: Any]]) {
     CFPreferencesSetAppValue("persistent-apps" as CFString, value as CFArray, domain)
     CFPreferencesAppSynchronize(domain)
-    let task = Process(); task.executableURL = URL(fileURLWithPath: "/usr/bin/killall"); task.arguments = ["Dock"]
+    // A graceful quit on macOS 27 can flush Dock's stale in-memory tile list
+    // over this update. Terminate without a shutdown writeback; launchd relaunches it.
+    let task = Process(); task.executableURL = URL(fileURLWithPath: "/usr/bin/killall"); task.arguments = ["-KILL", "Dock"]
     try? task.run(); task.waitUntilExit()
 }
 func removeSlots() {
     let old = tiles()
     // macOS strips spacer GUIDs. This prototype requires its reserved slots to be the
     // only full-size spacers and refuses ambiguous layouts rather than deleting.
-    guard let index = slotIndex(in: old) else { return }
-    var clean = old; clean.removeSubrange(index..<(index + reservedSlots))
+    let count = old.filter { $0["tile-type"] as? String == "spacer-tile" }.count
+    guard let index = slotIndex(in: old, count: count) else { return }
+    var clean = old; clean.removeSubrange(index..<(index + count))
     setTiles(clean)
 }
 if CommandLine.arguments.contains("--cleanup") { removeSlots(); exit(0) }
@@ -112,53 +114,42 @@ final class Delegate: NSObject, NSApplicationDelegate {
     var dragEntries: [[String: Any]] = []
     var dropCenters: [CGFloat] = []
     var dockBand = CGRect.zero
-    var collapsedFrame = CGRect.zero
-    var extraWidth: CGFloat = 0
-    var expanded = false
-    var progress = 0.0
-    var velocity = 0.0
-    var motion: Timer?
+    var reloadPID: pid_t?
+    var reloadStarted: TimeInterval = 0
+    var demoTimer: Timer?
     var resizeItem: NSMenuItem!
-    func applyWidth() {
-        guard !dragging, !collapsedFrame.isEmpty else { return }
-        var frame = collapsedFrame
-        frame.size.width += extraWidth * progress
-        panel.setFrame(frame, display: true)
-        graph.needsDisplay = true
+    @objc func cycleSize() {
+        demoTimer?.invalidate(); demoTimer = nil
+        changeSize(to: reservedSlots == 4 ? 2 : reservedSlots + 1)
     }
-    @objc func toggleExpansion() {
-        expanded.toggle()
-        let target = expanded ? 1.0 : 0.0
-        status.button?.title = expanded ? "3U" : "2U"
-        resizeItem.title = expanded ? "Collapse to 2U" : "Expand to 3U"
-        graph.toolTip = "Click to \(expanded ? "collapse" : "expand"); drag to move"
-        motion?.invalidate()
-        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
-            progress = target; velocity = 0; applyWidth(); return
-        }
-        var previous = CACurrentMediaTime()
-        let started = previous
-        var frames = 0
-        motion = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+    func changeSize(to count: Int) {
+        guard (2...4).contains(count), count != reservedSlots, !dragging, reloadPID == nil else { return }
+        var entries = tiles()
+        guard let index = slotIndex(in: entries) else { return }
+        entries.removeSubrange(index..<(index + reservedSlots))
+        entries.insert(contentsOf: (0..<count).map { _ in ["tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] }, at: index)
+        currentIndex = index
+        reloadPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+        reloadStarted = ProcessInfo.processInfo.systemUptime
+        reservedSlots = count
+        panel.orderOut(nil)
+        status.button?.title = "\(count)U"
+        resizeItem.title = count == 4 ? "Resize to 2U" : "Resize to \(count + 1)U"
+        graph.toolTip = "Click for \(count == 4 ? 2 : count + 1)U; drag to move"
+        setTiles(entries)
+        print("Reload requested for \(count)U"); fflush(stdout)
+    }
+    @objc func playDemo() {
+        guard !dragging, reloadPID == nil else { return }
+        demoTimer?.invalidate()
+        changeSize(to: 2)
+        var stages = [3, 4]
+        demoTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
-            let now = CACurrentMediaTime()
-            let dt = min(now - previous, 0.05); previous = now
-            guard !self.dragging else { return }
-            // Exact critically damped spring: reversals retain current velocity.
-            let omega = 26.0
-            let displacement = self.progress - target
-            let c = self.velocity + omega * displacement
-            let decay = exp(-omega * dt)
-            self.progress = target + (displacement + c * dt) * decay
-            self.velocity = (self.velocity - omega * c * dt) * decay
-            frames += 1
-            if abs(self.progress - target) < 0.001 && abs(self.velocity) < 0.02 {
-                self.progress = target; self.velocity = 0; timer.invalidate(); self.motion = nil
-                print("Resize settled: \(self.expanded ? "3U" : "2U"), frames=\(frames), duration=\(now - started)"); fflush(stdout)
-            }
-            self.applyWidth()
+            guard self.reloadPID == nil, !self.dragging else { return }
+            self.changeSize(to: stages.removeFirst())
+            if stages.isEmpty { timer.invalidate(); self.demoTimer = nil }
         }
-        RunLoop.main.add(motion!, forMode: .common)
     }
     func dockItems() -> [AXUIElement] {
         guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return [] }
@@ -167,6 +158,8 @@ final class Delegate: NSObject, NSApplicationDelegate {
         return attr(list, "AXChildren") as? [AXUIElement] ?? []
     }
     func beginDrag() {
+        demoTimer?.invalidate(); demoTimer = nil
+        guard reloadPID == nil else { return }
         dragEntries = tiles(); dropCenters = []
         guard let index = slotIndex(in: dragEntries) else { return }
         currentIndex = index
@@ -204,7 +197,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
         updated.insert(contentsOf: (0..<reservedSlots).map { _ in ["tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] }, at: currentIndex)
         setTiles(updated)
         panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 86, height: 41), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        panel.title = "Dock 2U CPU and memory"
+        panel.title = "Dock CPU and memory"
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -212,29 +205,35 @@ final class Delegate: NSObject, NSApplicationDelegate {
         panel.contentView = graph
         graph.onDragStart = { [weak self] in self?.beginDrag() }
         graph.onDragEnd = { [weak self] point in self?.endDrag(at: point) }
-        graph.onClick = { [weak self] in self?.toggleExpansion() }
-        graph.toolTip = "Click to expand; drag to move"
+        graph.onClick = { [weak self] in self?.cycleSize() }
+        graph.toolTip = "Click for 3U; drag to move"
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "2U"
         let menu = NSMenu()
-        resizeItem = menu.addItem(withTitle: "Expand to 3U", action: #selector(toggleExpansion), keyEquivalent: "e"); resizeItem.target = self
+        resizeItem = menu.addItem(withTitle: "Resize to 3U", action: #selector(cycleSize), keyEquivalent: "e"); resizeItem.target = self
+        let demo = menu.addItem(withTitle: "Play 2U → 3U → 4U demo", action: #selector(playDemo), keyEquivalent: "d"); demo.target = self
         menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "Quit and remove test slots", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self; status.menu = menu
         sample()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.sample() }
         tracking = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.position() }
+        if CommandLine.arguments.contains("--demo") {
+            demoTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in self?.playDemo() }
+        }
     }
     @objc func quitApp() { NSApp.terminate(nil) }
-    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); tracking?.invalidate(); motion?.invalidate(); panel.orderOut(nil); removeSlots() }
+    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); tracking?.invalidate(); demoTimer?.invalidate(); panel.orderOut(nil); removeSlots() }
     func position() {
         guard !dragging else { return }
+        let dockPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
+        if let previousPID = reloadPID, dockPID == nil || dockPID == previousPID { panel.orderOut(nil); return }
         let items = dockItems()
         let first = currentIndex + 1
-        guard items.count > first + 2,
+        guard items.count >= first + reservedSlots,
               (first..<(first + reservedSlots)).allSatisfy({ attr(items[$0], "AXSubrole") as? String == "AXSpacerDockItem" }),
-              let a = rect(items[first]), let b = rect(items[first + 1]), let c = rect(items[first + 2]), a.width > 20, b.width > 20,
-              abs(a.minY - b.minY) < 30 else { panel.orderOut(nil); return }
-        let union = a.union(b)
+              let a = rect(items[first]), let b = rect(items[first + 1]), let last = rect(items[first + reservedSlots - 1]), a.width > 20, b.width > 20,
+              abs(a.minY - last.minY) < 30 else { panel.orderOut(nil); return }
+        let union = a.union(last)
         let desktopTop = NSScreen.screens.first?.frame.maxY ?? 0
         let tileHeight = min(a.width, b.width) - 2
         let height = (tileHeight * 0.8).rounded()
@@ -242,9 +241,12 @@ final class Delegate: NSObject, NSApplicationDelegate {
         let sideInset = (min(a.width, b.width) - height) / 2
         let frame = CGRect(x: union.minX + sideInset, y: desktopTop - union.minY - height - topInset, width: union.width - 2 * sideInset, height: height)
         guard NSScreen.screens.contains(where: { $0.frame.intersects(frame) }), frame.minY >= 0 else { panel.orderOut(nil); return }
-        collapsedFrame = frame
-        extraWidth = max(0, c.maxX - b.maxX)
-        applyWidth(); panel.orderFrontRegardless()
+        panel.setFrame(frame, display: true); graph.needsDisplay = true
+        panel.orderFrontRegardless()
+        if reloadPID != nil {
+            print("Reload complete: \(reservedSlots)U, width=\(frame.width), seconds=\(ProcessInfo.processInfo.systemUptime - reloadStarted), Dock PID=\(dockPID ?? 0)"); fflush(stdout)
+            reloadPID = nil
+        }
     }
     func sample() {
         if !dragging, let index = slotIndex(in: tiles()) { currentIndex = index }
