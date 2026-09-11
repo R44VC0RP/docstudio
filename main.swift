@@ -3,7 +3,12 @@ import ApplicationServices
 import Darwin
 
 let domain = "com.apple.dock" as CFString
-let slotIDs = [927611021, 927611022]
+let placement = UserDefaults(suiteName: "local.dock-2u")!
+func slotIndex(in entries: [[String: Any]]) -> Int? {
+    let indices = entries.indices.filter { entries[$0]["tile-type"] as? String == "spacer-tile" }
+    guard indices.count == 2, indices[1] == indices[0] + 1 else { return nil }
+    return indices[0]
+}
 func tiles() -> [[String: Any]] {
     CFPreferencesAppSynchronize(domain)
     return CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) as? [[String: Any]] ?? []
@@ -16,13 +21,14 @@ func setTiles(_ value: [[String: Any]]) {
 }
 func removeSlots() {
     let old = tiles()
-    // macOS 27 strips spacer GUIDs. These test slots are deliberately fixed
-    // immediately after Finder; never remove spacers elsewhere in the Dock.
-    guard old.count >= 2, old.prefix(2).allSatisfy({ ($0["tile-type"] as? String) == "spacer-tile" }) else { return }
-    setTiles(Array(old.dropFirst(2)))
+    // macOS strips spacer GUIDs. This prototype requires its pair to be the
+    // only full-size spacers and refuses ambiguous layouts rather than deleting.
+    guard let index = slotIndex(in: old) else { return }
+    var clean = old; clean.removeSubrange(index..<(index + 2))
+    setTiles(clean)
 }
 if CommandLine.arguments.contains("--cleanup") { removeSlots(); exit(0) }
-guard (tiles().first?["tile-type"] as? String) != "spacer-tile" else { fputs("Leading spacers already exist; remove this experiment with --cleanup before relaunching.\n", stderr); exit(1) }
+guard !tiles().contains(where: { $0["tile-type"] as? String == "spacer-tile" }) else { fputs("Full-size spacers already exist; quit the running experiment before relaunching.\n", stderr); exit(1) }
 guard AXIsProcessTrusted() else { fputs("Accessibility permission is required for Dock tracking.\n", stderr); exit(1) }
 
 func attr(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
@@ -38,6 +44,29 @@ func rect(_ element: AXUIElement) -> CGRect? {
 
 final class Graph: NSView {
     var cpu: [Double] = [], memory: [Double] = []
+    var onDragStart: (() -> Void)?
+    var onDragEnd: ((CGPoint) -> Void)?
+    var dragOffset: CGPoint?
+    var didDrag = false
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        let point = NSEvent.mouseLocation
+        dragOffset = CGPoint(x: point.x - window.frame.minX, y: point.y - window.frame.minY)
+        didDrag = false; onDragStart?(); NSCursor.closedHand.push()
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let offset = dragOffset else { return }
+        didDrag = true
+        let point = NSEvent.mouseLocation
+        window?.setFrameOrigin(CGPoint(x: point.x - offset.x, y: point.y - offset.y))
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard dragOffset != nil else { return }
+        dragOffset = nil; NSCursor.pop()
+        onDragEnd?(didDrag ? NSEvent.mouseLocation : CGPoint(x: CGFloat.nan, y: CGFloat.nan))
+    }
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.075, alpha: 0.97).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
@@ -72,19 +101,63 @@ final class Delegate: NSObject, NSApplicationDelegate {
     var timer: Timer?, tracking: Timer?
     var lastTicks: [UInt32]?
     var sampleCount = 0
+    var dragging = false
+    var currentIndex = 0
+    var dragEntries: [[String: Any]] = []
+    var dropCenters: [CGFloat] = []
+    var dockBand = CGRect.zero
+    func dockItems() -> [AXUIElement] {
+        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return [] }
+        let root = AXUIElementCreateApplication(dock.processIdentifier)
+        guard let list = (attr(root, "AXChildren") as? [AXUIElement])?.first else { return [] }
+        return attr(list, "AXChildren") as? [AXUIElement] ?? []
+    }
+    func beginDrag() {
+        dragEntries = tiles(); dropCenters = []
+        guard let index = slotIndex(in: dragEntries) else { return }
+        currentIndex = index
+        let items = dockItems()
+        guard items.count > dragEntries.count else { return }
+        for i in dragEntries.indices where i != index && i != index + 1 {
+            guard let frame = rect(items[i + 1]) else { return }
+            dropCenters.append(frame.midX)
+        }
+        dockBand = panel.frame.insetBy(dx: 0, dy: -45)
+        dragging = true
+    }
+    func endDrag(at point: CGPoint) {
+        defer { dragging = false; position() }
+        guard dragging, point.x.isFinite, point.y >= dockBand.minY, point.y <= dockBand.maxY,
+              NSArray(array: tiles()).isEqual(to: dragEntries), let oldIndex = slotIndex(in: dragEntries) else { return }
+        let destination = dropCenters.filter { $0 < point.x }.count
+        guard destination != oldIndex else { return }
+        var updated = dragEntries
+        let pair = Array(updated[oldIndex..<(oldIndex + 2)])
+        updated.removeSubrange(oldIndex..<(oldIndex + 2))
+        updated.insert(contentsOf: pair, at: destination)
+        currentIndex = destination
+        placement.set(destination, forKey: "insertionIndex")
+        panel.orderOut(nil)
+        setTiles(updated)
+        print("Moved widget from slot \(oldIndex) to \(destination)"); fflush(stdout)
+    }
     func applicationDidFinishLaunching(_ notification: Notification) {
         let existing = tiles()
         let backup = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("dock-2u-before.plist")
         if !FileManager.default.fileExists(atPath: backup.path), let data = try? PropertyListSerialization.data(fromPropertyList: existing, format: .xml, options: 0) { try? data.write(to: backup) }
-        let clean = existing.filter { !slotIDs.contains($0["GUID"] as? Int ?? 0) }
-        setTiles(slotIDs.map { ["GUID": $0, "tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] } + clean)
+        currentIndex = min(existing.count, max(0, placement.integer(forKey: "insertionIndex")))
+        var updated = existing
+        updated.insert(contentsOf: (0..<2).map { _ in ["tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] }, at: currentIndex)
+        setTiles(updated)
         panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 86, height: 41), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.title = "Dock 2U CPU and memory"
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1)
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        panel.hidesOnDeactivate = false; panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false; panel.ignoresMouseEvents = false
         panel.contentView = graph
+        graph.onDragStart = { [weak self] in self?.beginDrag() }
+        graph.onDragEnd = { [weak self] point in self?.endDrag(at: point) }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "2U"
         let menu = NSMenu(); let quit = menu.addItem(withTitle: "Quit and remove test slots", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self; status.menu = menu
@@ -95,13 +168,13 @@ final class Delegate: NSObject, NSApplicationDelegate {
     @objc func quitApp() { NSApp.terminate(nil) }
     func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); tracking?.invalidate(); panel.orderOut(nil); removeSlots() }
     func position() {
-        guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { panel.orderOut(nil); return }
-        let root = AXUIElementCreateApplication(dock.processIdentifier)
-        guard let list = (attr(root, "AXChildren") as? [AXUIElement])?.first,
-              let items = attr(list, "AXChildren") as? [AXUIElement], items.count > 3,
-              (attr(items[1], "AXTitle") as? String ?? "").isEmpty,
-              (attr(items[2], "AXTitle") as? String ?? "").isEmpty,
-              let a = rect(items[1]), let b = rect(items[2]), a.width > 20, b.width > 20,
+        guard !dragging else { return }
+        let items = dockItems()
+        let first = currentIndex + 1
+        guard items.count > first + 1,
+              attr(items[first], "AXSubrole") as? String == "AXSpacerDockItem",
+              attr(items[first + 1], "AXSubrole") as? String == "AXSpacerDockItem",
+              let a = rect(items[first]), let b = rect(items[first + 1]), a.width > 20, b.width > 20,
               abs(a.minY - b.minY) < 30 else { panel.orderOut(nil); return }
         let union = a.union(b)
         let desktopTop = NSScreen.screens.first?.frame.maxY ?? 0
@@ -114,6 +187,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
         panel.setFrame(frame, display: true); panel.orderFrontRegardless()
     }
     func sample() {
+        if !dragging, let index = slotIndex(in: tiles()) { currentIndex = index }
         var info = host_cpu_load_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &count) } }
