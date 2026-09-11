@@ -100,8 +100,10 @@ final class Delegate: NSObject, NSApplicationDelegate {
               abs(a.minY - b.minY) < 30 else { panel.orderOut(nil); return }
         let union = a.union(b)
         let desktopTop = NSScreen.screens.first?.frame.maxY ?? 0
-        let height = min(a.width, b.width) - 2
-        let frame = CGRect(x: union.minX + 2, y: desktopTop - union.minY - height - 6, width: union.width - 4, height: height)
+        let tileHeight = min(a.width, b.width) - 2
+        let height = (tileHeight * 0.8).rounded()
+        let topInset = (tileHeight - height) / 2 + 7
+        let frame = CGRect(x: union.minX + 2, y: desktopTop - union.minY - height - topInset, width: union.width - 4, height: height)
         guard NSScreen.screens.contains(where: { $0.frame.intersects(frame) }), frame.minY >= 0 else { panel.orderOut(nil); return }
         panel.setFrame(frame, display: true); panel.orderFrontRegardless()
     }
