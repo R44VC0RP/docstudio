@@ -1,12 +1,14 @@
 import AppKit
 import ApplicationServices
 import Darwin
+import QuartzCore
 
 let domain = "com.apple.dock" as CFString
 let placement = UserDefaults(suiteName: "local.dock-2u")!
+let reservedSlots = 3
 func slotIndex(in entries: [[String: Any]]) -> Int? {
     let indices = entries.indices.filter { entries[$0]["tile-type"] as? String == "spacer-tile" }
-    guard indices.count == 2, indices[1] == indices[0] + 1 else { return nil }
+    guard indices.count == reservedSlots, indices == Array(indices[0]..<(indices[0] + reservedSlots)) else { return nil }
     return indices[0]
 }
 func tiles() -> [[String: Any]] {
@@ -21,10 +23,10 @@ func setTiles(_ value: [[String: Any]]) {
 }
 func removeSlots() {
     let old = tiles()
-    // macOS strips spacer GUIDs. This prototype requires its pair to be the
+    // macOS strips spacer GUIDs. This prototype requires its reserved slots to be the
     // only full-size spacers and refuses ambiguous layouts rather than deleting.
     guard let index = slotIndex(in: old) else { return }
-    var clean = old; clean.removeSubrange(index..<(index + 2))
+    var clean = old; clean.removeSubrange(index..<(index + reservedSlots))
     setTiles(clean)
 }
 if CommandLine.arguments.contains("--cleanup") { removeSlots(); exit(0) }
@@ -46,6 +48,8 @@ final class Graph: NSView {
     var cpu: [Double] = [], memory: [Double] = []
     var onDragStart: (() -> Void)?
     var onDragEnd: ((CGPoint) -> Void)?
+    var onClick: (() -> Void)?
+    var pressPoint = CGPoint.zero
     var dragOffset: CGPoint?
     var didDrag = false
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -54,18 +58,20 @@ final class Graph: NSView {
         guard let window else { return }
         let point = NSEvent.mouseLocation
         dragOffset = CGPoint(x: point.x - window.frame.minX, y: point.y - window.frame.minY)
-        didDrag = false; onDragStart?(); NSCursor.closedHand.push()
+        pressPoint = point; didDrag = false; onDragStart?(); NSCursor.closedHand.push()
     }
     override func mouseDragged(with event: NSEvent) {
         guard let offset = dragOffset else { return }
-        didDrag = true
         let point = NSEvent.mouseLocation
+        guard didDrag || hypot(point.x - pressPoint.x, point.y - pressPoint.y) > 3 else { return }
+        didDrag = true
         window?.setFrameOrigin(CGPoint(x: point.x - offset.x, y: point.y - offset.y))
     }
     override func mouseUp(with event: NSEvent) {
         guard dragOffset != nil else { return }
         dragOffset = nil; NSCursor.pop()
         onDragEnd?(didDrag ? NSEvent.mouseLocation : CGPoint(x: CGFloat.nan, y: CGFloat.nan))
+        if !didDrag { onClick?() }
     }
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedWhite: 0.075, alpha: 0.97).setFill()
@@ -106,6 +112,54 @@ final class Delegate: NSObject, NSApplicationDelegate {
     var dragEntries: [[String: Any]] = []
     var dropCenters: [CGFloat] = []
     var dockBand = CGRect.zero
+    var collapsedFrame = CGRect.zero
+    var extraWidth: CGFloat = 0
+    var expanded = false
+    var progress = 0.0
+    var velocity = 0.0
+    var motion: Timer?
+    var resizeItem: NSMenuItem!
+    func applyWidth() {
+        guard !dragging, !collapsedFrame.isEmpty else { return }
+        var frame = collapsedFrame
+        frame.size.width += extraWidth * progress
+        panel.setFrame(frame, display: true)
+        graph.needsDisplay = true
+    }
+    @objc func toggleExpansion() {
+        expanded.toggle()
+        let target = expanded ? 1.0 : 0.0
+        status.button?.title = expanded ? "3U" : "2U"
+        resizeItem.title = expanded ? "Collapse to 2U" : "Expand to 3U"
+        graph.toolTip = "Click to \(expanded ? "collapse" : "expand"); drag to move"
+        motion?.invalidate()
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            progress = target; velocity = 0; applyWidth(); return
+        }
+        var previous = CACurrentMediaTime()
+        let started = previous
+        var frames = 0
+        motion = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            let now = CACurrentMediaTime()
+            let dt = min(now - previous, 0.05); previous = now
+            guard !self.dragging else { return }
+            // Exact critically damped spring: reversals retain current velocity.
+            let omega = 26.0
+            let displacement = self.progress - target
+            let c = self.velocity + omega * displacement
+            let decay = exp(-omega * dt)
+            self.progress = target + (displacement + c * dt) * decay
+            self.velocity = (self.velocity - omega * c * dt) * decay
+            frames += 1
+            if abs(self.progress - target) < 0.001 && abs(self.velocity) < 0.02 {
+                self.progress = target; self.velocity = 0; timer.invalidate(); self.motion = nil
+                print("Resize settled: \(self.expanded ? "3U" : "2U"), frames=\(frames), duration=\(now - started)"); fflush(stdout)
+            }
+            self.applyWidth()
+        }
+        RunLoop.main.add(motion!, forMode: .common)
+    }
     func dockItems() -> [AXUIElement] {
         guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return [] }
         let root = AXUIElementCreateApplication(dock.processIdentifier)
@@ -118,7 +172,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
         currentIndex = index
         let items = dockItems()
         guard items.count > dragEntries.count else { return }
-        for i in dragEntries.indices where i != index && i != index + 1 {
+        for i in dragEntries.indices where !(index..<(index + reservedSlots)).contains(i) {
             guard let frame = rect(items[i + 1]) else { return }
             dropCenters.append(frame.midX)
         }
@@ -132,8 +186,8 @@ final class Delegate: NSObject, NSApplicationDelegate {
         let destination = dropCenters.filter { $0 < point.x }.count
         guard destination != oldIndex else { return }
         var updated = dragEntries
-        let pair = Array(updated[oldIndex..<(oldIndex + 2)])
-        updated.removeSubrange(oldIndex..<(oldIndex + 2))
+        let pair = Array(updated[oldIndex..<(oldIndex + reservedSlots)])
+        updated.removeSubrange(oldIndex..<(oldIndex + reservedSlots))
         updated.insert(contentsOf: pair, at: destination)
         currentIndex = destination
         placement.set(destination, forKey: "insertionIndex")
@@ -147,7 +201,7 @@ final class Delegate: NSObject, NSApplicationDelegate {
         if !FileManager.default.fileExists(atPath: backup.path), let data = try? PropertyListSerialization.data(fromPropertyList: existing, format: .xml, options: 0) { try? data.write(to: backup) }
         currentIndex = min(existing.count, max(0, placement.integer(forKey: "insertionIndex")))
         var updated = existing
-        updated.insert(contentsOf: (0..<2).map { _ in ["tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] }, at: currentIndex)
+        updated.insert(contentsOf: (0..<reservedSlots).map { _ in ["tile-type": "spacer-tile", "tile-data": [:]] as [String: Any] }, at: currentIndex)
         setTiles(updated)
         panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 86, height: 41), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.title = "Dock 2U CPU and memory"
@@ -158,23 +212,27 @@ final class Delegate: NSObject, NSApplicationDelegate {
         panel.contentView = graph
         graph.onDragStart = { [weak self] in self?.beginDrag() }
         graph.onDragEnd = { [weak self] point in self?.endDrag(at: point) }
+        graph.onClick = { [weak self] in self?.toggleExpansion() }
+        graph.toolTip = "Click to expand; drag to move"
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.title = "2U"
-        let menu = NSMenu(); let quit = menu.addItem(withTitle: "Quit and remove test slots", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self; status.menu = menu
+        let menu = NSMenu()
+        resizeItem = menu.addItem(withTitle: "Expand to 3U", action: #selector(toggleExpansion), keyEquivalent: "e"); resizeItem.target = self
+        menu.addItem(.separator())
+        let quit = menu.addItem(withTitle: "Quit and remove test slots", action: #selector(quitApp), keyEquivalent: "q"); quit.target = self; status.menu = menu
         sample()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.sample() }
         tracking = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in self?.position() }
     }
     @objc func quitApp() { NSApp.terminate(nil) }
-    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); tracking?.invalidate(); panel.orderOut(nil); removeSlots() }
+    func applicationWillTerminate(_ notification: Notification) { timer?.invalidate(); tracking?.invalidate(); motion?.invalidate(); panel.orderOut(nil); removeSlots() }
     func position() {
         guard !dragging else { return }
         let items = dockItems()
         let first = currentIndex + 1
-        guard items.count > first + 1,
-              attr(items[first], "AXSubrole") as? String == "AXSpacerDockItem",
-              attr(items[first + 1], "AXSubrole") as? String == "AXSpacerDockItem",
-              let a = rect(items[first]), let b = rect(items[first + 1]), a.width > 20, b.width > 20,
+        guard items.count > first + 2,
+              (first..<(first + reservedSlots)).allSatisfy({ attr(items[$0], "AXSubrole") as? String == "AXSpacerDockItem" }),
+              let a = rect(items[first]), let b = rect(items[first + 1]), let c = rect(items[first + 2]), a.width > 20, b.width > 20,
               abs(a.minY - b.minY) < 30 else { panel.orderOut(nil); return }
         let union = a.union(b)
         let desktopTop = NSScreen.screens.first?.frame.maxY ?? 0
@@ -184,7 +242,9 @@ final class Delegate: NSObject, NSApplicationDelegate {
         let sideInset = (min(a.width, b.width) - height) / 2
         let frame = CGRect(x: union.minX + sideInset, y: desktopTop - union.minY - height - topInset, width: union.width - 2 * sideInset, height: height)
         guard NSScreen.screens.contains(where: { $0.frame.intersects(frame) }), frame.minY >= 0 else { panel.orderOut(nil); return }
-        panel.setFrame(frame, display: true); panel.orderFrontRegardless()
+        collapsedFrame = frame
+        extraWidth = max(0, c.maxX - b.maxX)
+        applyWidth(); panel.orderFrontRegardless()
     }
     func sample() {
         if !dragging, let index = slotIndex(in: tiles()) { currentIndex = index }
