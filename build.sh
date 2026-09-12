@@ -18,5 +18,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 iconutil -c icns "$ROOT/.build/DockStudio.iconset" -o "$APP/Contents/Resources/DockStudio.icns"
 cp "$ROOT/.build/DockStudio" "$APP/Contents/MacOS/DockStudio"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
-codesign --force --sign - --identifier com.vogel.dockstudio "$APP"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
+SIGNING_FLAGS=(--force --sign "$SIGNING_IDENTITY" --identifier com.vogel.dockstudio)
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  SIGNING_FLAGS+=(--options runtime --timestamp)
+fi
+codesign "${SIGNING_FLAGS[@]}" "$APP"
 printf 'Built %s\n' "$APP"

@@ -4,6 +4,12 @@ A native macOS app for arranging live widgets in your Dock. Drag widgets into th
 
 ![Dock Studio’s widget gallery, customization controls, and Dock preview](assets/dock-studio.png)
 
+## Download
+
+**[Download Dock Studio 1.0 for Apple Silicon](https://github.com/R44VC0RP/docstudio/releases/download/v1.0/Dock-Studio-1.0-arm64.dmg)** — Developer ID signed and notarized by Apple.
+
+Open the DMG and drag **Dock Studio** into **Applications**. Requires macOS 14 or later and a bottom-positioned Dock. Enable Accessibility when prompted before applying a layout.
+
 ## What’s built
 
 Dock Studio is an early working prototype, built with SwiftUI and AppKit.
@@ -41,7 +47,7 @@ Changing the layout requires a reload, so the Dock briefly disappears and return
 | Seamless layout animation | Native neighboring icons do not smoothly slide aside as a widget expands. Changing the allocated width still requires Apply and a Dock reload. |
 | Every Dock configuration | The app currently requires a bottom-positioned Dock. Multi-monitor transitions, auto-hide, magnification, Spaces, and full-screen behavior need broader testing and refinement. |
 | Connected widgets | No agent-status, Git/CI, deployment, weather, meeting-event, music-service, or Stripe integrations yet. The current catalog is local-first. |
-| Distribution | No notarized release, automatic updater, Intel build target, or built-in launch-at-login option. The build script creates a locally ad-hoc-signed app. |
+| Distribution | A signed, notarized Apple Silicon DMG is available. There is no automatic updater, Intel build target, or built-in launch-at-login option yet. Source builds use ad-hoc signing unless `SIGNING_IDENTITY` is supplied. |
 | Automated coverage | No automated test suite or CI pipeline yet. Layout ownership, persistence, recovery, and rendering need more coverage. |
 
 The architecture depends on Dock preference behavior that Apple does not provide as a supported widget-extension API. macOS updates may require adjustments. Compatibility reports are especially useful.
