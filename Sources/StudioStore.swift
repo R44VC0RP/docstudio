@@ -2,6 +2,13 @@ import AppKit
 import SwiftUI
 import ApplicationServices
 
+enum QuitCleanupResult {
+    case readyToQuit
+    case ownershipUnresolved
+    case dockRestoreFailed(String)
+    case persistenceFailed
+}
+
 @MainActor final class StudioStore: ObservableObject {
     @Published var draft: [DockEntry] = []
     @Published var applied: [DockEntry] = []
@@ -12,16 +19,20 @@ import ApplicationServices
     @Published var message: String?
     @Published var isError = false
     @Published var applying = false
+    @Published private(set) var recoveryAvailable = false
     @Published var catalog: [WidgetKind: WidgetInstance] = Dictionary(uniqueKeysWithValues: WidgetKind.allCases.map { ($0, WidgetInstance(kind: $0)) })
     let telemetry = Telemetry()
     let timers = WidgetTimers()
     var overlays: DockOverlays?
     var placements: [WidgetPlacement] = []
+    private var unreconciled: (placements: [WidgetPlacement], appKeys: [String])?
+    private var persistenceFailed = false
     private var baselineKeys: [String] = []
     private var appliedKeys: [String] = []
     private var reloadTimer: Timer?
     private let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Dock Studio", isDirectory: true)
     private var stateURL: URL { folder.appendingPathComponent("layout.json") }
+    private var recoveryURL: URL { folder.appendingPathComponent("before-apply.plist") }
     var widgetCount: Int { draft.filter { $0.widget != nil }.count }
     var totalUnits: Int { draft.compactMap(\.widget).reduce(0) { $0 + $1.units } }
     var hasChanges: Bool { draft != applied }
@@ -38,13 +49,21 @@ import ApplicationServices
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let saved = (try? Data(contentsOf: stateURL)).flatMap { try? JSONDecoder().decode(SavedLayout.self, from: $0) }
         let current = Self.readDock()
-        let owned = saved.flatMap { Self.ownedIndices(in: current, placements: $0.placements, appKeys: $0.appliedAppKeys) } ?? []
+        // Distinguish “no widgets” from “could not safely identify widget slots”.
+        let identified: Set<Int>?
+        if let saved, !saved.placements.isEmpty {
+            identified = Self.ownedIndices(in: current, placements: saved.placements, appKeys: saved.appliedAppKeys)
+            if identified == nil { unreconciled = (saved.placements, saved.appliedAppKeys) }
+        } else {
+            identified = []
+        }
+        let owned = identified ?? []
         let raw = current.enumerated().filter { !owned.contains($0.offset) }.map(\.element)
         pinned = Self.pinnedItems(raw)
         baselineKeys = pinned.map(\.id)
         let base = pinned.map { DockEntry.app($0.id) }
-        if let saved, !owned.isEmpty {
-            placements = Self.relocated(saved.placements, indices: owned)
+        if let saved, let identified, !identified.isEmpty {
+            placements = Self.relocated(saved.placements, indices: identified)
             applied = Self.layout(pinned: pinned, groups: placements, count: current.count); appliedKeys = baselineKeys
         } else { applied = base; appliedKeys = baselineKeys }
         if let saved {
@@ -57,7 +76,15 @@ import ApplicationServices
             draft.append(contentsOf: baselineKeys.filter { !included.contains($0) }.map { .app($0) })
         } else { draft = applied }
         selectedID = draft.first(where: { $0.widget != nil })?.id ?? "catalog:system"
-        if !placements.isEmpty && !AXIsProcessTrusted() { message = "Allow Accessibility to reconnect your Dock widgets."; isError = true }
+        refreshRecoveryAvailable()
+        if identified == nil {
+            message = recoveryAvailable
+                ? "The Dock changed outside Dock Studio. Restore the recovery copy to remove leftover widget slots."
+                : "The Dock changed outside Dock Studio. Widget slots could not be identified safely."
+            isError = true
+        } else if !placements.isEmpty && !AXIsProcessTrusted() {
+            message = "Allow Accessibility to reconnect your Dock widgets."; isError = true
+        }
     }
     func startOverlays() {
         overlays = DockOverlays(telemetry: telemetry, timers: timers) { [weak self] widget in
@@ -109,11 +136,21 @@ import ApplicationServices
         guard AXIsProcessTrusted() else { message = "Allow Dock Studio in Accessibility, then apply again."; isError = true; permission(); return }
         let orientation = UserDefaults(suiteName: "com.apple.dock")?.string(forKey: "orientation") ?? "bottom"
         guard orientation == "bottom" else { message = "This version needs a bottom-positioned Dock."; isError = true; return }
+        guard unreconciled == nil else {
+            message = recoveryAvailable
+                ? "Restore the recovery copy to clean up leftover widget slots before applying."
+                : "The Dock changed outside Dock Studio. Reload the layout before applying."
+            isError = true; return
+        }
         let current = Self.readDock()
         let own: Set<Int>
         if placements.isEmpty { own = [] }
         else if let indices = Self.ownedIndices(in: current, placements: placements, appKeys: appliedKeys) { own = indices }
-        else { message = "The Dock changed outside Dock Studio. Reload the layout before applying."; isError = true; return }
+        else {
+            unreconciled = (placements, appliedKeys)
+            refreshRecoveryAvailable()
+            message = "The Dock changed outside Dock Studio. Reload the layout before applying."; isError = true; return
+        }
         let currentKeys = Self.keys(current.enumerated().filter { !own.contains($0.offset) }.map(\.element))
         let expected = appliedKeys
         guard currentKeys == expected else { message = "Your pinned apps changed. Reload the layout before applying."; isError = true; return }
@@ -133,9 +170,9 @@ import ApplicationServices
         let staged = SavedLayout(draft: normalized, applied: normalized, placements: groups, appliedAppKeys: newPins.map(\.id))
         do {
             // Recovery and ownership must be durable before touching the real Dock.
-            let backup = try PropertyListSerialization.data(fromPropertyList: current, format: .binary, options: 0)
-            try backup.write(to: folder.appendingPathComponent("before-apply.plist"), options: .atomic)
+            try writeRecovery(currentApps)
             try writeState(staged)
+            refreshRecoveryAvailable()
         } catch { message = "Couldn’t save the layout safely: \(error.localizedDescription)"; isError = true; return }
         let oldPID = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first?.processIdentifier
         applying = true; message = nil; isError = false
@@ -149,7 +186,9 @@ import ApplicationServices
         }
         pinned = newPins; baselineKeys = newPins.map(\.id)
         applied = normalized; draft = normalized; placements = groups; appliedKeys = baselineKeys
+        unreconciled = nil
         overlays?.update(groups)
+        refreshRecoveryAvailable()
         let started = ProcessInfo.processInfo.systemUptime
         reloadTimer?.invalidate()
         reloadTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] timer in
@@ -173,31 +212,122 @@ import ApplicationServices
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
         let current = Self.readDock()
-        let own = Self.ownedIndices(in: current, placements: placements, appKeys: appliedKeys) ?? []
-        if !placements.isEmpty && own.isEmpty { message = "Could not identify the widget slots safely. Quit and restore the Dock before reloading."; isError = true; return }
+        let toCheckPlacements = unreconciled?.placements ?? placements
+        let toCheckKeys = unreconciled?.appKeys ?? appliedKeys
+        let identified = toCheckPlacements.isEmpty ? Optional(Set<Int>()) : Self.ownedIndices(in: current, placements: toCheckPlacements, appKeys: toCheckKeys)
+        guard let own = identified else {
+            unreconciled = (toCheckPlacements, toCheckKeys)
+            refreshRecoveryAvailable()
+            message = recoveryAvailable
+                ? "Could not identify the widget slots safely. Restore the recovery copy before reloading."
+                : "Could not identify the widget slots safely. Quit and restore the Dock before reloading."
+            isError = true; return
+        }
+        unreconciled = nil
         pinned = Self.pinnedItems(current.enumerated().filter { !own.contains($0.offset) }.map(\.element))
         baselineKeys = pinned.map(\.id)
-        placements = Self.relocated(placements, indices: own)
+        placements = Self.relocated(toCheckPlacements, indices: own)
         let entries = Self.layout(pinned: pinned, groups: placements, count: current.count)
         applied = entries; draft = entries; appliedKeys = entries.compactMap(\.appKey); overlays?.update(placements); changed()
+        refreshRecoveryAvailable()
     }
-    func restoreDockOnQuit() -> Bool {
-        guard !placements.isEmpty else { overlays?.stop(); return true }
+    /// Writes the recovery snapshot taken before the last Apply back to the Dock.
+    @discardableResult
+    func restoreFromRecovery(confirm: Bool = true) -> Bool {
+        guard let backup = readRecovery() else {
+            refreshRecoveryAvailable()
+            message = "No recovery copy is available."; isError = true
+            return false
+        }
+        if confirm {
+            let alert = NSAlert()
+            alert.messageText = "Restore the Dock from the recovery copy?"
+            alert.informativeText = "This replaces the current Dock layout with the snapshot saved before the last Apply. Leftover widget slots from that Apply are removed. Your draft layout stays available to apply again."
+            alert.addButton(withTitle: "Restore Dock"); alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        }
+        reloadTimer?.invalidate(); reloadTimer = nil
+        applying = false
+        overlays?.hide()
+        do { try Self.writeDock(backup) }
+        catch {
+            overlays?.update(placements)
+            message = "Couldn’t restore the Dock: \(error.localizedDescription)"; isError = true
+            return false
+        }
+        // Snapshot is the Dock before that Apply; clear ownership for the layout we just reverted.
+        pinned = Self.pinnedItems(backup)
+        baselineKeys = pinned.map(\.id)
+        placements = []
+        unreconciled = nil
+        applied = pinned.map { .app($0.id) }
+        appliedKeys = baselineKeys
+        var included = Set<String>()
+        var newDraft = draft.filter { entry in
+            if entry.widget != nil { return true }
+            guard let key = entry.appKey, baselineKeys.contains(key) else { return false }
+            return included.insert(key).inserted
+        }
+        newDraft.append(contentsOf: baselineKeys.filter { !included.contains($0) }.map { .app($0) })
+        draft = newDraft
+        selectedID = draft.first(where: { $0.widget != nil })?.id ?? "catalog:system"
+        overlays?.update([])
+        guard persist() else { return false }
+        refreshRecoveryAvailable()
+        message = "Restored the Dock from the recovery copy"; isError = false
+        return true
+    }
+    func restoreDockOnQuit() -> QuitCleanupResult {
+        guard !placements.isEmpty || unreconciled != nil else {
+            guard !persistenceFailed || persist() else { return .persistenceFailed }
+            overlays?.stop()
+            return .readyToQuit
+        }
         let current = Self.readDock()
-        guard let own = Self.ownedIndices(in: current, placements: placements, appKeys: appliedKeys) else { return false }
+        let toClean = unreconciled?.placements ?? placements
+        let keys = unreconciled?.appKeys ?? appliedKeys
+        guard let own = Self.ownedIndices(in: current, placements: toClean, appKeys: keys) else {
+            if unreconciled == nil && !placements.isEmpty {
+                unreconciled = (placements, appliedKeys)
+                refreshRecoveryAvailable()
+            }
+            return .ownershipUnresolved
+        }
         do { try Self.writeDock(current.enumerated().filter { !own.contains($0.offset) }.map(\.element)) }
-        catch { return false } // Keep ownership data for recovery on the next launch.
+        catch { return .dockRestoreFailed(error.localizedDescription) }
         reloadTimer?.invalidate(); overlays?.stop()
-        placements = []; applied = pinned.map { .app($0.id) }; appliedKeys = baselineKeys; persist(); return true
+        placements = []; unreconciled = nil; applied = pinned.map { .app($0.id) }; appliedKeys = baselineKeys
+        return persist() ? .readyToQuit : .persistenceFailed
+    }
+    private func readRecovery() -> [[String: Any]]? {
+        guard let data = try? Data(contentsOf: recoveryURL) else { return nil }
+        guard let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) else { return nil }
+        return object as? [[String: Any]]
+    }
+    private func writeRecovery(_ entries: [[String: Any]]) throws {
+        let backup = try PropertyListSerialization.data(fromPropertyList: entries, format: .binary, options: 0)
+        try backup.write(to: recoveryURL, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recoveryURL.path)
+    }
+    private func refreshRecoveryAvailable() {
+        recoveryAvailable = readRecovery() != nil && unreconciled != nil
     }
     private func writeState(_ state: SavedLayout) throws {
         let data = try JSONEncoder().encode(state)
         try data.write(to: stateURL, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
     }
-    private func persist() {
-        do { try writeState(SavedLayout(draft: draft, applied: applied, placements: placements, appliedAppKeys: appliedKeys)) }
-        catch { message = "Couldn’t save your changes: \(error.localizedDescription)"; isError = true }
+    @discardableResult
+    private func persist() -> Bool {
+        do {
+            try writeState(SavedLayout(draft: draft, applied: applied, placements: placements, appliedAppKeys: appliedKeys))
+            persistenceFailed = false
+            return true
+        } catch {
+            persistenceFailed = true
+            message = "Couldn’t save your changes: \(error.localizedDescription)"; isError = true
+            return false
+        }
     }
     static func readDock() -> [[String: Any]] {
         let domain = "com.apple.dock" as CFString
