@@ -66,11 +66,45 @@ if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--export-ico
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWindow(); return true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard store != nil, !store.restoreDockOnQuit() else { return .terminateNow }
-        let alert = NSAlert(); alert.messageText = "The Dock layout changed outside Dock Studio"
-        alert.informativeText = "The widget slots could not be identified safely. Keep running to check the layout, or quit and leave those slots untouched."
-        alert.addButton(withTitle: "Keep running"); alert.addButton(withTitle: "Quit without restoring")
-        return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        guard let store else { return .terminateNow }
+        switch store.restoreDockOnQuit() {
+        case .readyToQuit:
+            return .terminateNow
+        case .persistenceFailed:
+            let alert = NSAlert()
+            alert.messageText = "Could not save Dock Studio layout"
+            let detail = store.message.map { " \($0)" } ?? ""
+            alert.informativeText = "The Dock no longer contains active Dock Studio widget slots, but Dock Studio could not save your layout.\(detail) Keep running to retry, or quit anyway."
+            alert.addButton(withTitle: "Keep running")
+            alert.addButton(withTitle: "Quit anyway")
+            return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        case .dockRestoreFailed(let errorDescription):
+            let alert = NSAlert()
+            alert.messageText = "Could not restore the Dock"
+            alert.informativeText = "Dock Studio could not update your Dock preferences (\(errorDescription)). Keep running to retry, or quit without restoring."
+            alert.addButton(withTitle: "Keep running")
+            alert.addButton(withTitle: "Quit without restoring")
+            return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        case .ownershipUnresolved:
+            let alert = NSAlert(); alert.messageText = "The Dock layout changed outside Dock Studio"
+            if store.recoveryAvailable {
+                alert.informativeText = "The widget slots could not be identified safely. Restore the recovery copy taken before the last Apply, keep running, or quit and leave those slots untouched."
+                alert.addButton(withTitle: "Restore recovery copy")
+                alert.addButton(withTitle: "Keep running")
+                alert.addButton(withTitle: "Quit without restoring")
+                switch alert.runModal() {
+                case .alertFirstButtonReturn:
+                    return store.restoreFromRecovery(confirm: false) ? .terminateNow : .terminateCancel
+                case .alertThirdButtonReturn:
+                    return .terminateNow
+                default:
+                    return .terminateCancel
+                }
+            }
+            alert.informativeText = "The widget slots could not be identified safely. Keep running to check the layout, or quit and leave those slots untouched."
+            alert.addButton(withTitle: "Keep running"); alert.addButton(withTitle: "Quit without restoring")
+            return alert.runModal() == .alertSecondButtonReturn ? .terminateNow : .terminateCancel
+        }
     }
 }
 MainActor.assumeIsolated {

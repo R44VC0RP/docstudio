@@ -71,6 +71,18 @@ struct StudioView: View {
                 }
                 Text("Widgets keep running when you close this window.").font(.studio(11)).foregroundStyle(.white.opacity(0.34)).lineSpacing(3).fixedSize(horizontal: false, vertical: true)
                 Button { store.reloadLayout() } label: { Label("Reload layout", systemImage: "arrow.clockwise").font(.studio(11.5)).frame(height: 40, alignment: .leading) }.buttonStyle(.plain).foregroundStyle(muted)
+                if store.recoveryAvailable {
+                    Button { store.restoreFromRecovery() } label: {
+                        Label("Restore recovery copy", systemImage: "arrow.uturn.backward")
+                            .font(.studio(11.5))
+                            .lineLimit(1)
+                            .frame(height: 40, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Color(red: 0.98, green: 0.58, blue: 0.61))
+                    .help("Replace the Dock with the snapshot saved before the last Apply")
+                    .disabled(store.applying)
+                }
                 Button { store.permission() } label: { Label("Accessibility", systemImage: "hand.raised").font(.studio(11.5)).frame(height: 40, alignment: .leading) }.buttonStyle(.plain).foregroundStyle(muted)
             }.padding(18)
         }.frame(width: 174).background(ink)
